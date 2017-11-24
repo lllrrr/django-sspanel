@@ -1,10 +1,15 @@
+import datetime
 import json
+from decimal import Decimal
 from random import randint
 
+from django.conf import settings
 from django.contrib.auth.decorators import login_required, permission_required
 from django.shortcuts import HttpResponse, render
+from django.utils import timezone
 
-from shadowsocks.models import User, NodeOnlineLog, Node, Donate, InviteCode
+from shadowsocks.models import (Donate, InviteCode, Node, NodeOnlineLog,
+                                PurchaseHistory, RebateRecord, Shop, User)
 from ssserver.models import SSUser, TrafficLog
 
 # Create your views here.
@@ -75,8 +80,7 @@ def change_ss_port(request):
     '''
     user = request.user.ss_user
     # 找到端口池中最大的端口
-    max_port_user = SSUser.objects.order_by('-port').first()
-    port = max_port_user.port + randint(1, 3)
+    port = SSUser.randomPord()
     user.port = port
     user.save()
     registerinfo = {
@@ -97,7 +101,11 @@ def gen_invite_code(request):
     返回是否成功
     '''
     u = request.user
-    num = u.invitecode_num - len(InviteCode.objects.filter(code_id=u.pk))
+    if u.pk == 1:
+        # 针对管理员特出处理，每次生成5个邀请码
+        num = 5
+    else:
+        num = u.invitecode_num - len(InviteCode.objects.filter(code_id=u.pk))
     if num > 0:
         for i in range(num):
             code = InviteCode(type=0, code_id=u.pk)
@@ -117,13 +125,49 @@ def gen_invite_code(request):
 
     return HttpResponse(result, content_type='application/json')
 
-'''
-a9Gz6g5Q9bF49qfD7wxkB4Qq
 
-40uFF28yVfhF3i1QwSGs06m5
+@login_required
+def purchase(request):
+    '''
+    购买商品的逻辑
+    返回是否成功
+    '''
+    if request.method == "POST":
+        user = request.user
+        ss_user = user.ss_user
+        goodId = request.POST.get('goodId')
+        good = Shop.objects.get(pk=goodId)
+        if user.balance < good.money:
+            registerinfo = {
+                'title': '金额不足！',
+                'subtitle': '请去捐赠界面/联系站长充值',
+                'status': 'error', }
+        else:
+            # 验证成功进行提权操作
+            ss_user.enable = True
+            ss_user.transfer_enable += good.transfer
+            user.balance -= good.money
+            user.level = good.level
+            user.level_expire_time = timezone.now() + datetime.timedelta(days=good.days)
+            ss_user.save()
+            user.save()
+            # 增加购买记录
+            record = PurchaseHistory(info=good, user=user, money=good.money,
+                                     purchtime=timezone.now())
+            record.save()
+            # 增加返利记录
+            inviter = User.objects.get(pk=user.invited_by)
+            rebaterecord = RebateRecord(
+                user_id=inviter.pk, money=good.money * Decimal(settings.INVITE_PERCENT))
+            inviter.balance += rebaterecord.money
+            inviter.save()
+            rebaterecord.save()
+            registerinfo = {
+                'title': '购买成功',
+                'subtitle': '请在用户中心检查最新信息',
+                'status': 'success', }
 
-
-bl5OcyrsGLzQ6lhWOBWBsFV5
-
-FAgiQjHuDA37ViabtBjgdsm5
-'''
+        result = json.dumps(registerinfo, ensure_ascii=False)
+        return HttpResponse(result, content_type='application/json')
+    else:
+        return HttpResponse('errors')

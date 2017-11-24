@@ -55,8 +55,7 @@ def ssclient(request):
 
 def ssinvite(request):
     '''跳转到邀请码界面'''
-
-    codelist = InviteCode.objects.filter(type='1')[:20]
+    codelist = InviteCode.objects.filter(type=1, isused=False, code_id=1)[:20]
 
     context = {'codelist': codelist, }
 
@@ -193,7 +192,6 @@ def userinfo(request):
         anno = Announcement.objects.all()[0]
     except:
         anno = None
-
     min_traffic = '{}m'.format(int(settings.MIN_CHECKIN_TRAFFIC / 1024 / 1024))
     max_traffic = '{}m'.format(int(settings.MAX_CHECKIN_TRAFFIC / 1024 / 1024))
     remain_traffic = 100 - eval(user.ss_user.get_used_percentage())
@@ -244,16 +242,8 @@ def get_ssr_qrcode(request, node_id):
     # 加入节点信息等级判断
     if user.level < node.level:
         return HttpResponse('哟小伙子，可以啊！但是投机取巧是不对的哦！')
-
-    # 符合ssr qrcode schema最后需要特殊处理的密码部分
-    ssr_password = base64.b64encode(
-        bytes(ss_user.password, 'utf8')).decode('ascii')
-    ssr_code = '{}:{}:{}:{}:{}:{}'.format(
-        node.server, ss_user.port, ss_user.protocol, ss_user.method, ss_user.obfs, ssr_password)
-    # 将信息编码
-    ssr_pass = base64.b64encode(bytes(ssr_code, 'utf8')).decode('ascii')
-    # 生成ss二维码
-    ssr_img = qrcode.make('ssr://{}'.format(ssr_pass))
+    ssr_link = node.get_ssr_link(ss_user)
+    ssr_img = qrcode.make(ssr_link)
     buf = BytesIO()
     ssr_img.save(buf)
     image_stream = buf.getvalue()
@@ -274,12 +264,8 @@ def get_ss_qrcode(request, node_id):
     # 加入节点信息等级判断
     if user.level < node.level:
         return HttpResponse('哟小伙子，可以啊！但是投机取巧是不对的哦！')
-    ss_code = '{}:{}@{}:{}'.format(
-        node.method, ss_user.password, node.server, ss_user.port)
-    # 将信息编码
-    ss_pass = base64.b64encode(bytes(ss_code, 'utf8')).decode('ascii')
-    # 生成ss二维码
-    ss_img = qrcode.make('ss://{}'.format(ss_pass))
+    ss_link = node.get_ss_link(ss_user)
+    ss_img = qrcode.make(ss_link)
     buf = BytesIO()
     ss_img.save(buf)
     image_stream = buf.getvalue()
@@ -439,13 +425,16 @@ def nodeinfo(request):
             node['online'] = False
             node['count'] = 0
         nodelists.append(node)
-
+    # 订阅地址
+    token = base64.b64encode(
+        bytes(user.username, 'utf-8')).decode('ascii') + '&&' + base64.b64encode(bytes(user.password, 'utf-8')).decode('ascii')
+    sub_link = settings.HOST + 'server/subscribe/' + token
     context = {
         'nodelists': nodelists,
         'ss_user': ss_user,
         'user': user,
+        'sub_link': sub_link,
     }
-
     return render(request, 'sspanel/nodeinfo.html', context=context)
 
 
@@ -716,12 +705,21 @@ def ticket_edit(request, pk):
 @login_required
 def affiliate(request):
     '''推广页面'''
-    invidecodes = InviteCode.objects.filter(code_id=request.user.pk, type=0)
+
+    if request.user.pk != 1:
+        invidecodes = InviteCode.objects.filter(
+            code_id=request.user.pk, type=0)
+        inviteNum = request.user.invitecode_num - len(invidecodes)
+    else:
+        # 如果是管理员，特殊处理
+        # 写死，每次呢个生成5额邀请码
+        invidecodes = InviteCode.objects.filter(
+            code_id=request.user.pk, type=0, isused=False)
+        inviteNum = 5
     context = {
         'invitecodes': invidecodes,
         'invitePercent': settings.INVITE_PERCENT * 100,
-        'inviteNumn': request.user.invitecode_num - len(invidecodes)
-    }
+        'inviteNumn': inviteNum}
     return render(request, 'sspanel/affiliate.html', context=context)
 
 
@@ -729,7 +727,7 @@ def affiliate(request):
 def rebate_record(request):
     '''返利记录'''
     u = request.user
-    records = RebateRecord.objects.filter(user_id=u.pk)
+    records = RebateRecord.objects.filter(user_id=u.pk)[:10]
     context = {
         'records': records,
         'user': request.user,
@@ -828,7 +826,6 @@ def node_create(request):
         form = NodeForm(request.POST)
         if form.is_valid():
             form.save()
-
             nodes = Node.objects.all()
             registerinfo = {
                 'title': '添加成功',
@@ -960,11 +957,15 @@ def backend_Aliveuser(request):
 @permission_required('shadowsocks')
 def backend_UserList(request):
     '''返回所有用户的View'''
-
     obj = User
     page_num = 15
     context = Page_List_View(request, obj, page_num).get_page_context()
-
+    try:
+        registerinfo = request.session['registerinfo']
+        del request.session['registerinfo']
+        context.update({'registerinfo': registerinfo})
+    except:
+        pass
     return render(request, 'backend/userlist.html', context=context)
 
 
@@ -1043,7 +1044,7 @@ def gen_invite_code(request):
         code = InviteCode(type=type)
         code.save()
 
-    code_list = InviteCode.objects.filter(type=0)
+    code_list = InviteCode.objects.filter(type=0, isused=False)
     registerinfo = {
         'title': '成功',
         'subtitle': '添加邀请码{}个'.format(Num),
@@ -1122,14 +1123,16 @@ def good_edit(request, pk):
     goods = Shop.objects.all()
     # 当为post请求时，修改数据
     if request.method == "POST":
-        form = ShopForm(request.POST, instance=good)
+        # 转换为GB
+        data = request.POST.copy()
+        data['transfer'] = eval(data['transfer']) * settings.GB
+        form = ShopForm(data, instance=good)
         if form.is_valid():
             form.save()
             registerinfo = {
                 'title': '修改成功',
                 'subtitle': '数据更新成功',
                 'status': 'success', }
-
             context = {
                 'goods': goods,
                 'registerinfo': registerinfo,
@@ -1140,7 +1143,6 @@ def good_edit(request, pk):
                 'title': '错误',
                 'subtitle': '数据填写错误',
                 'status': 'error', }
-
             context = {
                 'form': form,
                 'registerinfo': registerinfo,
@@ -1149,7 +1151,8 @@ def good_edit(request, pk):
             return render(request, 'backend/goodedit.html', context=context)
     # 当请求不是post时，渲染form
     else:
-        form = ShopForm(instance=good)
+        data = {'transfer': round(good.transfer / settings.GB)}
+        form = ShopForm(initial=data, instance=good)
         context = {
             'form': form,
             'good': good,
@@ -1161,16 +1164,17 @@ def good_edit(request, pk):
 def good_create(request):
     '''商品创建'''
     if request.method == "POST":
-        form = ShopForm(request.POST)
+        # 转换为GB
+        data = request.POST.copy()
+        data['transfer'] = eval(data['transfer']) * settings.GB
+        form = ShopForm(data)
         if form.is_valid():
             form.save()
-
             goods = Shop.objects.all()
             registerinfo = {
                 'title': '添加成功',
                 'subtitle': '数据更新成功！',
                 'status': 'success', }
-
             context = {
                 'goods': goods,
                 'registerinfo': registerinfo,
@@ -1181,13 +1185,11 @@ def good_create(request):
                 'title': '错误',
                 'subtitle': '数据填写错误',
                 'status': 'error', }
-
             context = {
                 'form': form,
                 'registerinfo': registerinfo,
             }
             return render(request, 'backend/goodcreate.html', context=context)
-
     else:
         form = ShopForm()
         return render(request, 'backend/goodcreate.html', context={'form': form, })
